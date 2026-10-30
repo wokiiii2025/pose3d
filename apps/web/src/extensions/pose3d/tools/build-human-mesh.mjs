@@ -1,0 +1,28 @@
+/** Offline asset derivation only. Reads data; never executes upstream code. */
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {gunzipSync} from 'node:zlib';
+import {fileURLToPath} from 'node:url';
+const source=process.argv[2];
+if(!source)throw Error('Usage: node build-human-mesh.mjs <verified-upstream-pack>');
+const compressed=fs.readFileSync(source);
+if(crypto.createHash('sha256').update(compressed).digest('hex')!=='76adfddc9a98ecd89e5b4a334911e65469fc77939e3fb0500832ab9e2a1baec9')throw Error('Upstream asset hash differs from the reviewed revision');
+const raw=gunzipSync(compressed),length=raw.readUInt32LE(8),header=JSON.parse(raw.subarray(12,12+length));
+if(raw.subarray(0,8).toString()!=='VNMHJS02'||header.version!==2)throw Error('Unknown asset schema');
+const start=Math.ceil((12+length)/4)*4;
+const read=(key,bytes,fn)=>{const d=header[key];return Array.from({length:d.length},(_,i)=>raw[fn](start+d.offset+i*bytes));};
+const positions=read('base_vertices',4,'readFloatLE'),indices=read('base_indices',4,'readUInt32LE'),skin=read('skin_indices',2,'readUInt16LE'),weights=read('skin_weights',4,'readFloatLE');
+const used=[...new Set(indices)].sort((a,b)=>a-b),map=new Map(used.map((v,i)=>[v,i]));
+const floor=Math.min(...used.map(i=>positions[i*3+1])),top=Math.max(...used.map(i=>positions[i*3+1])),scale=1.75/(top-floor);
+const normalize=point=>point.map((v,a)=>(v-(a===1?floor:0))*scale);
+const average=key=>{const points=header.joints[key];if(!points?.length)throw Error('Missing bone anchors');return normalize([0,1,2].map(axis=>points.reduce((sum,i)=>sum+positions[i*3+axis],0)/points.length));};
+const bones=header.bones.map(b=>({name:b.name,parent:header.bones.findIndex(p=>p.name===b.parent),head:average(b.head_joint),tail:average(b.tail_joint)}));
+const vertexPositions=used.flatMap(i=>normalize(positions.slice(i*3,i*3+3))),jointIndices=used.flatMap(i=>skin.slice(i*4,i*4+4)),jointWeights=used.flatMap(i=>{const w=weights.slice(i*4,i*4+4),sum=w.reduce((a,b)=>a+b,0);if(sum<=0)throw Error('Unweighted drawn vertex');return w.map(x=>x/sum);});
+const arrays={positions:new Float32Array(vertexPositions),indices:new Uint16Array(indices.map(i=>map.get(i))),skinIndices:new Uint16Array(jointIndices),skinWeights:new Float32Array(jointWeights)};
+const descriptors={};let offset=0;
+const chunks=Object.entries(arrays).map(([key,array])=>{descriptors[key]={offset,length:array.length};const bytes=Buffer.from(array.buffer);offset+=bytes.length;return bytes;});
+const metadata=Buffer.from(JSON.stringify({version:1,height:1.75,bones,...descriptors}));
+const dataStart=Math.ceil((12+metadata.length)/4)*4,prefix=Buffer.alloc(dataStart);prefix.write('CFHM0001');prefix.writeUInt32LE(metadata.length,8);metadata.copy(prefix,12);
+const output=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../assets/human-neutral.bin');fs.mkdirSync(path.dirname(output),{recursive:true});fs.writeFileSync(output,Buffer.concat([prefix,...chunks]));
+console.log(`HUMAN_ASSET_RESULT ${used.length} vertices; ${indices.length/3} triangles; ${bones.length} bones; ${fs.statSync(output).size} bytes`);
